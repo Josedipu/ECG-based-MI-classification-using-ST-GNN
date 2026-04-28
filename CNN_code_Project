@@ -1,0 +1,207 @@
+#Import necessities
+import os
+import re
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt, resample
+import pywt
+import wfdb
+from sklearn.preprocessing import LabelEncoder
+# --- Signal Processing Functions ---
+def bandpass_filter(data, lowcut, highcut, fs, order=4):
+nyq = 0.5 * fs
+low = lowcut / nyq
+high = highcut / nyq
+b, a = butter(order, [low, high], btype='band')
+y = filtfilt(b, a, data)
+return y
+def wavelet_denoise(data, wavelet='sym4', level=1):
+coeff = pywt.wavedec(data, wavelet, mode='per')
+sigma = np.median(np.abs(coeff[-level])) / 0.6745
+uthresh = sigma * np.sqrt(2 * np.log(len(data)))
+coeff[1:] = [pywt.threshold(i, value=uthresh, mode='soft') for i in coeff[1:]]
+return pywt.waverec(coeff, wavelet, mode='per')
+def lms_filter(desired, input_signal, mu=0.01, filter_order=5):
+n_samples = len(input_signal)
+w = np.zeros(filter_order)
+y = np.zeros(n_samples)
+e = np.zeros(n_samples)
+for n in range(filter_order, n_samples):
+x = input_signal[n-filter_order:n][::-1]
+y[n] = np.dot(w, x)
+e[n] = desired[n] - y[n]
+w += 2 * mu * e[n] * x
+return e
+def segment_and_downsample(ecg_signal, original_fs=1000, target_fs=125, window_sec=4):
+num_samples = int(len(ecg_signal) * target_fs / original_fs)
+downsampled = resample(ecg_signal, num_samples)
+window_size = window_sec * target_fs
+num_windows = num_samples // window_size
+segments = []
+for i in range(num_windows):
+start = i * window_size
+end = start + window_size
+segment = downsampled[start:end]
+if len(segment) == window_size:
+segments.append(segment)
+return np.array(segments)
+def preprocess_multilead(record_path, original_fs=1000, target_fs=125, window_sec=4, target_leads=12):
+record = wfdb.rdrecord(record_path)
+num_leads_in_record = record.p_signal.shape[1]
+all_lead_segments = []
+for lead in range(num_leads_in_record):
+ecg_signal = record.p_signal[:, lead]
+filtered_signal = bandpass_filter(ecg_signal, 0.5, 40, original_fs)
+denoised_signal = wavelet_denoise(filtered_signal)
+adapted_signal = lms_filter(denoised_signal, np.roll(denoised_signal, 1))
+segments = segment_and_downsample(adapted_signal, original_fs=original_fs,
+target_fs=target_fs, window_sec=window_sec)
+all_lead_segments.append(segments)
+# Pad missing leads with zeros if less than target_leads
+if num_leads_in_record < target_leads:
+num_segments = all_lead_segments[0].shape[0]
+window_size = all_lead_segments[0].shape[1]
+for _ in range(target_leads - num_leads_in_record):
+all_lead_segments.append(np.zeros((num_segments, window_size)))
+all_lead_segments = np.stack(all_lead_segments, axis=0)
+all_lead_segments = np.transpose(all_lead_segments, (1, 0, 2))
+return all_lead_segments
+# --- Load Labels CSV ---
+ptb_label_df = pd.read_csv('/Users/josedipu/Desktop/MAIN PROJECT/Classified-Data-Sheet1.csv')
+ptb_label_df.columns = ptb_label_df.columns.str.strip()
+ptb_label_map = dict(zip(ptb_label_df['Patient ID'], ptb_label_df['Label']))
+staffiii_label = 'EMI'
+# --- Paths ---
+ptb_base_dir = '/Users/josedipu/Desktop/MAIN PROJECT/ptb-diagnostic-ecg-database-1.0.0/ptb-diagnostic-ecg-database-1.0.0'
+staffiii_dir = '/Users/josedipu/Desktop/MAIN PROJECT/ptb-diagnostic-ecg-database-1.0.0/staff-iii-database-1.0.0/data'
+ptb_patient_dirs = [os.path.join(ptb_base_dir, d) for d in os.listdir(ptb_base_dir) if os.path.isdir(os.path.join(ptb_base_dir, d))]
+all_segments = []
+all_segment_labels = []
+# --- Extract patient ID from folder name ---
+def extract_patient_id_from_folder(folder_path):
+folder_name = os.path.basename(folder_path)
+match = re.search(r'\d+', folder_name)
+if match:
+return int(match.group())
+else:
+return None
+# --- Process PTB dataset ---
+for patient_dir in ptb_patient_dirs:
+patient_id = extract_patient_id_from_folder(patient_dir)
+if patient_id is None:
+print(f"Skipping folder with unknown patient ID: {patient_dir}")
+continue
+records = [f[:-4] for f in os.listdir(patient_dir) if f.endswith('.dat')]
+if not records:
+print(f"No ECG records found in {patient_dir}")
+continue
+record_name = records[0]
+record_path = os.path.join(patient_dir, record_name)
+try:
+patient_segments = preprocess_multilead(record_path)
+all_segments.append(patient_segments)
+patient_label = ptb_label_map.get(patient_id, '0')
+all_segment_labels.extend([patient_label] * patient_segments.shape[0])
+print(f"Processed Patient folder {patient_dir}, record {record_name}, segments: {patient_segments.shape[0]}, patient ID: {patient_id}, label: {patient_label}")
+except Exception as e:
+print(f"Failed for {record_path}: {e}")
+# Determine target shape as the minimum/maximum across all arrays for each dimension
+all_shapes = [seg.shape for seg in all_segments]
+max_segments = max(s[0] for s in all_shapes)
+max_leads = 12 # enforce 12 leads
+max_samples = 500 # enforce 500 samples per segment
+uniform_segments = []
+for seg in all_segments:
+seg_segments, seg_leads, seg_samples = seg.shape
+# Pad or truncate segments dimension
+if seg_segments > max_segments:
+seg = seg[:max_segments, :, :]
+elif seg_segments < max_segments:
+pad_width = ((0, max_segments - seg_segments), (0,0), (0,0))
+seg = np.pad(seg, pad_width=pad_width, mode='constant')
+# Pad or truncate leads dimension
+if seg_leads > max_leads:
+seg = seg[:, :max_leads, :]
+elif seg_leads < max_leads:
+pad_width = ((0,0), (0, max_leads - seg_leads), (0,0))
+seg = np.pad(seg, pad_width=pad_width, mode='constant')
+# Pad or truncate samples dimension
+if seg_samples > max_samples:
+seg = seg[:, :, :max_samples]
+elif seg_samples < max_samples:
+pad_width = ((0,0), (0,0), (0, max_samples - seg_samples))
+seg = np.pad(seg, pad_width=pad_width, mode='constant')
+uniform_segments.append(seg)
+all_segments_array = np.stack(uniform_segments, axis=0)
+print(f"Final stacked segments shape: {all_segments_array.shape}")
+# --- Encode labels ---
+le = LabelEncoder()
+numeric_labels = le.fit_transform(all_segment_labels)
+print(f"Encoded classes: {list(le.classes_)}")
+# Data Quality Verification
+import matplotlib.pyplot as plt
+import numpy as np
+# Function to detect poor-quality segments based on amplitude and variance
+# Revised detection with looser thresholds
+def detect_poor_quality_segments(segments, amp_threshold=1.0, var_threshold=1e-6):
+poor_quality_indices = []
+for i, segment in enumerate(segments):
+max_amp = np.max(np.abs(segment))
+var_amp = np.var(segment)
+# Relaxed thresholds for amplitude and variance
+if max_amp > amp_threshold or var_amp < var_threshold:
+poor_quality_indices.append(i)
+print(f"Found {len(poor_quality_indices)} poor quality segments out of {len(segments)} total")
+return poor_quality_indices
+# Use this updated function instead of previous:
+bad_segments_idx = detect_poor_quality_segments(all_segments_array)
+print(f"Before removal: {all_segments_array.shape[0]} segments, labels: {len(numeric_labels)}")
+# Optionally skip removal temporarily to enable pipeline flow:
+# clean_segments = np.delete(all_segments_array, bad_segments_idx, axis=0)
+# clean_labels = np.delete(numeric_labels, bad_segments_idx, axis=0)
+# Instead, assign raw data to continue testing:
+clean_segments = all_segments_array
+clean_labels = numeric_labels
+print(f"After cleaning (skipped removal): {clean_segments.shape[0]} segments, labels: {len(clean_labels)}")
+# Check for empty or NaN segments (optional)
+empty_or_nan_indices = [i for i, seg in enumerate(clean_segments) if seg.size == 0 or np.isnan(seg).any()]
+if empty_or_nan_indices:
+print(f"Warning: Found {len(empty_or_nan_indices)} empty or NaN segments")
+# Normalize as before with epsilon:
+epsilon = 1e-8
+mean_val = np.mean(clean_segments, axis=(0, 2), keepdims=True)
+std_val = np.std(clean_segments, axis=(0, 2), keepdims=True)
+normalized_segments = (clean_segments - mean_val) / (std_val + epsilon)
+print(f"Normalized segments shape: {normalized_segments.shape}")
+#Data Preparation for modelling
+import numpy as np
+print(f"Number of segments before cleaning invalids: {clean_segments.shape[0]}")
+# Identify empty or NaN-containing segments
+empty_or_nan_indices = [i for i, seg in enumerate(clean_segments) if seg.size == 0 or np.isnan(seg).any()]
+print(f"Found {len(empty_or_nan_indices)} empty or invalid segments.")
+# Remove these invalid segments and their labels
+if empty_or_nan_indices:
+clean_segments = np.delete(clean_segments, empty_or_nan_indices, axis=0)
+clean_labels = np.delete(clean_labels, empty_or_nan_indices, axis=0)
+print(f"Removed {len(empty_or_nan_indices)} invalid segments. Remaining segments: {clean_segments.shape[0]}")
+# Now safely normalize with epsilon to avoid division errors
+epsilon = 1e-8
+mean_val = np.mean(clean_segments, axis=(0, 2), keepdims=True)
+std_val = np.std(clean_segments, axis=(0, 2), keepdims=True)
+normalized_segments = (clean_segments - mean_val) / (std_val + epsilon)
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.utils import to_categorical
+# 1. Normalize the ECG segments (z-score standardization per lead)
+mean_val = np.mean(clean_segments, axis=(0, 2), keepdims=True)
+std_val = np.std(clean_segments, axis=(0, 2), keepdims=True)
+normalized_segments = (clean_segments - mean_val) / (std_val + 1e-8)
+print(f"Normalized segments shape: {normalized_segments.shape}")
+# 2. Encode string labels to integers and convert to one-hot vectors
+le = LabelEncoder()
+integer_labels = le.fit_transform(clean_labels)
+one_hot_labels = to_categorical(integer_labels)
+print(f"One-hot labels shape: {one_hot_labels.shape}")
+print(f"Classes: {list(le.classes_)}")
+# 3. Add channel dimension for CNN input compatibility
+normalized_segments = normalized_segments[..., np.newaxis] # shape: (samples, leads, segment_length, 1)
+print(f"Input shape for CNN models: {normalized_segments.shape}")
