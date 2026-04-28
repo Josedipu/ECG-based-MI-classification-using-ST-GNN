@@ -1,0 +1,805 @@
+CNN- BiLSTM
+Divided to 5 cells
+1)
+# ==========================================
+# CELL 1: SETUP & FUNCTIONS
+# ==========================================
+import os
+import re
+import random
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt, resample
+import pywt
+import wfdb
+import tensorflow as tf
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.utils import class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, Bidirectional, LSTM, Dense, Dropout, concatenate, BatchNormalization, Add
+from tensorflow.keras.utils import to_categorical
+import matplotlib.pyplot as plt
+print("Libraries Imported Successfully!")
+# --- PATHS (Update if needed) ---
+ptb_base_dir = r'C:\Users\Jyothis P\Downloads\ptb-diagnostic-ecg-database-1.0.0\ptb-diagnostic-ecg-database-1.0.0'
+staffiii_dir = r'C:\Users\Jyothis P\Downloads\staff-iii-database-1.0.0'
+label_csv_path = r'C:\Users\Jyothis P\Downloads\Classified Data - Sheet1.csv'
+# --- SIGNAL PROCESSING FUNCTIONS ---
+def bandpass_filter(data, lowcut, highcut, fs, order=4):
+nyq = 0.5 * fs
+low = lowcut / nyq
+high = highcut / nyq
+b, a = butter(order, [low, high], btype='band')
+y = filtfilt(b, a, data)
+return y
+def wavelet_denoise(data, wavelet='sym4', level=1):
+if np.all(data == 0) or np.std(data) == 0: return data
+coeff = pywt.wavedec(data, wavelet, mode='per')
+sigma = np.median(np.abs(coeff[-level])) / 0.6745
+if sigma == 0: return data
+uthresh = sigma * np.sqrt(2 * np.log(len(data)))
+coeff[1:] = [pywt.threshold(i, value=uthresh, mode='soft') for i in coeff[1:]]
+return pywt.waverec(coeff, wavelet, mode='per')
+def lms_filter(desired, input_signal, mu=0.01, filter_order=5):
+n_samples = len(input_signal)
+w = np.zeros(filter_order)
+y = np.zeros(n_samples)
+e = np.zeros(n_samples)
+epsilon = 1e-6
+for n in range(filter_order, n_samples):
+x = input_signal[n-filter_order:n][::-1]
+y[n] = np.dot(w, x)
+e[n] = desired[n] - y[n]
+norm_factor = np.dot(x, x) + epsilon
+w += (mu / norm_factor) * e[n] * x
+return e
+def segment_and_downsample(ecg_signal, original_fs=1000, target_fs=125, window_sec=4):
+num_samples = int(len(ecg_signal) * target_fs / original_fs)
+downsampled = resample(ecg_signal, num_samples)
+window_size = window_sec * target_fs
+num_windows = num_samples // window_size
+segments = []
+for i in range(num_windows):
+start = i * window_size
+end = start + window_size
+segments.append(downsampled[start:end])
+return np.array(segments)
+def preprocess_multilead(record_path, original_fs=1000, target_fs=125, window_sec=4, target_leads=12):
+try:
+record = wfdb.rdrecord(record_path)
+except:
+record = wfdb.rdrecord(record_path, channels=[0])
+available_leads = record.p_signal.shape[1]
+leads_to_process = min(available_leads, target_leads)
+all_lead_segments = []
+for lead in range(leads_to_process):
+ecg_signal = record.p_signal[:, lead]
+filtered_signal = bandpass_filter(ecg_signal, 0.5, 40, original_fs)
+denoised_signal = wavelet_denoise(filtered_signal)
+adapted_signal = lms_filter(denoised_signal, np.roll(denoised_signal, 1))
+segments = segment_and_downsample(adapted_signal, original_fs=original_fs, target_fs=target_fs, window_sec=window_sec)
+all_lead_segments.append(segments)
+if len(all_lead_segments) < target_leads:
+if len(all_lead_segments) > 0:
+num_segments = all_lead_segments[0].shape[0]
+window_size = all_lead_segments[0].shape[1]
+for _ in range(target_leads - len(all_lead_segments)):
+all_lead_segments.append(np.zeros((num_segments, window_size)))
+else:
+return np.array([])
+all_lead_segments = np.stack(all_lead_segments, axis=0)
+all_lead_segments = np.transpose(all_lead_segments, (1, 2, 0))
+return all_lead_segments
+2)
+# ==========================================
+# CELL 2: LOAD & PROCESS DATA (Takes Time)
+# ==========================================
+print("\n--- Starting Data Processing ---")
+# Load Labels
+ptb_label_df = pd.read_csv(label_csv_path)
+ptb_label_df.columns = ptb_label_df.columns.str.strip()
+ptb_label_map = dict(zip(ptb_label_df['Patient ID'], ptb_label_df['Label']))
+all_segments = []
+all_labels = []
+# --- Process PTB ---
+print("Processing PTB...")
+ptb_patient_dirs = [os.path.join(ptb_base_dir, d) for d in os.listdir(ptb_base_dir) if os.path.isdir(os.path.join(ptb_base_dir, d))]
+for patient_dir in ptb_patient_dirs:
+if "UnigramPreview" in patient_dir: continue
+folder_name = os.path.basename(patient_dir)
+match = re.search(r'\d+', folder_name)
+if not match: continue
+patient_id = int(match.group())
+records = [f[:-4] for f in os.listdir(patient_dir) if f.endswith('.dat')]
+if not records: continue
+try:
+segs = preprocess_multilead(os.path.join(patient_dir, records[0]))
+if len(segs) > 0:
+all_segments.append(segs)
+label = ptb_label_map.get(patient_id, 'Unknown')
+all_labels.extend([label] * segs.shape[0])
+print(f"Processed PTB Patient {patient_id}")
+except Exception as e:
+pass
+# --- Process STAFF III ---
+print("\nProcessing STAFF III...")
+if os.path.exists(staffiii_dir):
+data_path = os.path.join(staffiii_dir, 'data')
+search_path = data_path if os.path.exists(data_path) else staffiii_dir
+staff_files = sorted(list(set([f[:-4] for f in os.listdir(search_path) if f.endswith('.dat')])))
+count = 0
+for rec in staff_files:
+try:
+segs = preprocess_multilead(os.path.join(search_path, rec))
+if len(segs) > 0:
+all_segments.append(segs)
+all_labels.extend(['EMI'] * segs.shape[0])
+count += 1
+if count % 20 == 0: print(f"Processed {count} STAFF III files...")
+except:
+continue
+else:
+print("❌ Staff III path not found.")
+print("Processing Complete!")
+3) # ==========================================
+# CELL 3: CONSOLIDATE & BALANCE
+# ==========================================
+# 1. Consolidate Segments
+if 'all_segments' in locals() and len(all_segments) > 0:
+print("Consolidating segments...")
+X_combined = np.concatenate(all_segments, axis=0)
+else:
+raise ValueError("STOP! No segments found. Run Cell 2 again.")
+print(f"Initial Shape: {X_combined.shape}")
+print(f"Initial Label Count: {len(all_labels)}")
+# 2. Fix Labels ('0' -> 'HC')
+print("Fixing labels...")
+all_labels = ['HC' if x == '0' else x for x in all_labels]
+# 3. Balance (Downsample EMI)
+indices_emi = [i for i, label in enumerate(all_labels) if label == 'EMI']
+indices_others = [i for i, label in enumerate(all_labels) if label != 'EMI']
+if len(indices_emi) > 2000:
+print(f"Downsampling {len(indices_emi)} EMI samples to 1,500...")
+random.seed(42)
+selected_emi_indices = random.sample(indices_emi, 1500)
+balanced_indices = indices_others + selected_emi_indices
+random.shuffle(balanced_indices)
+# Apply Filter
+X_combined = X_combined[balanced_indices]
+all_labels = [all_labels[i] for i in balanced_indices]
+print(f"✅ Data Balanced! Final Size: {len(all_labels)}")
+else:
+print("Data balanced enough.")
+4)
+# ==========================================
+# CELL 4: PREPARE, CLEAN & BALANCE (Best Quality Data)
+# ==========================================
+import numpy as np
+import random
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.utils import class_weight
+print("--- 1. PREPARING DATA ---")
+# A. Consolidate (Safety Check)
+if 'X_combined' not in locals():
+if 'all_segments' in locals() and len(all_segments) > 0:
+X_combined = np.concatenate(all_segments, axis=0)
+else:
+raise ValueError("STOP! Data missing. Run Cell 2 (Loading) first.")
+# B. Clean NaNs (Critical)
+if np.isnan(X_combined).any():
+print("⚠️ Cleaning NaNs...")
+X_combined = np.nan_to_num(X_combined)
+# C. BALANCE DATA (Downsample EMI)
+all_labels = ['HC' if x == '0' else x for x in all_labels]
+indices_emi = [i for i, label in enumerate(all_labels) if label == 'EMI']
+indices_others = [i for i, label in enumerate(all_labels) if label != 'EMI']
+if len(indices_emi) > 2000:
+print(f"Downsampling {len(indices_emi)} EMI samples to 1,500...")
+random.seed(42)
+selected_emi_indices = random.sample(indices_emi, 1500)
+balanced_indices = indices_others + selected_emi_indices
+random.shuffle(balanced_indices)
+X_balanced = X_combined[balanced_indices]
+Y_balanced = [all_labels[i] for i in balanced_indices]
+else:
+X_balanced = X_combined
+Y_balanced = all_labels
+print(f"Balanced Data Size: {len(Y_balanced)}")
+# D. FIX UNITS (Per-Sample Normalization - The Key to Success)
+print("--- FIXING UNITS ---")
+epsilon = 1e-8
+# Normalize each heartbeat individually so Units don't matter
+mean_val = np.mean(X_balanced, axis=1, keepdims=True)
+std_val = np.std(X_balanced, axis=1, keepdims=True)
+X_normalized = (X_balanced - mean_val) / (std_val + epsilon)
+# E. ENCODE & SPLIT
+le = LabelEncoder()
+Y_integers = le.fit_transform(Y_balanced)
+Y_onehot = to_categorical(Y_integers)
+TARGET_CLASSES = list(le.classes_)
+print(f"Classes: {TARGET_CLASSES}")
+X_train, X_test, Y_train, Y_test = train_test_split(X_normalized, Y_onehot, test_size=0.2, random_state=42, stratify=Y_onehot)
+X_train, X_val, Y_train, Y_val = train_test_split(X_train, Y_train, test_size=0.2, random_state=42, stratify=Y_train)
+# Weights
+Y_train_int = np.argmax(Y_train, axis=1)
+class_labels_int = np.unique(Y_train_int)
+weights = class_weight.compute_class_weight(class_weight='balanced', classes=class_labels_int, y=Y_train_int)
+class_weights_dict = dict(zip(class_labels_int, weights))
+print("✅ READY! Run Cell 5 now.")
+5)
+# ==========================================
+# CELL 5: TRAIN PURE CNN-LSTM (Max Results)
+# ==========================================
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, Bidirectional, LSTM, Dense, Dropout, concatenate, BatchNormalization, Add
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+# 1. DEFINE MODEL (MSAR-Net)
+def build_msar_net(input_shape, num_classes):
+input_tensor = Input(shape=input_shape)
+# CNN Block
+conv1 = Conv1D(32, 5, activation='relu', padding='same')(input_tensor)
+bn1 = BatchNormalization()(conv1)
+conv2 = Conv1D(32, 25, activation='relu', padding='same')(input_tensor)
+bn2 = BatchNormalization()(conv2)
+merged = concatenate([bn1, bn2], axis=-1)
+# ResNet Block
+res = Conv1D(64, 1, activation='relu', padding='same')(input_tensor)
+conv_out = Add()([merged, res])
+conv_out = Dropout(0.3)(conv_out)
+# LSTM Block
+lstm1 = Bidirectional(LSTM(64, return_sequences=True))(conv_out)
+lstm2 = Bidirectional(LSTM(32))(lstm1)
+lstm2 = Dropout(0.3)(lstm2)
+# Output
+out = Dense(num_classes, activation='softmax')(Dense(64, activation='relu')(lstm2))
+return Model(inputs=input_tensor, outputs=out)
+# 2. COMPILE
+INPUT_SHAPE = (X_train.shape[1], X_train.shape[2])
+model = build_msar_net(INPUT_SHAPE, len(TARGET_CLASSES))
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+# 3. CALLBACKS (The Secret Weapon)
+callbacks = [
+# Reduce LR if stuck (This gets you those extra % points)
+tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1, min_lr=0.00001),
+# Stop if really stuck
+tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
+# Save best
+tf.keras.callbacks.ModelCheckpoint('best_ecg_model.keras', monitor='val_loss', save_best_only=True, verbose=1)
+]
+# 4. TRAIN
+print(f"\n--- Training on {len(X_train)} samples ---")
+history = model.fit(
+X_train, Y_train,
+epochs=50, # Long training
+batch_size=32,
+validation_data=(X_val, Y_val),
+class_weight=class_weights_dict,
+callbacks=callbacks,
+verbose=1
+)
+# 5. EVALUATE
+print("\n--- Final Results ---")
+loss, acc = model.evaluate(X_test, Y_test, verbose=0)
+print(f"Test Accuracy: {acc:.4f}")
+Y_pred = np.argmax(model.predict(X_test), axis=1)
+Y_true = np.argmax(Y_test, axis=1)
+print("\nClassification Report:")
+print(classification_report(Y_true, Y_pred, target_names=TARGET_CLASSES))
+# 6. PLOT GRAPHS
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.title('Loss')
+plt.legend()
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='Train Acc')
+plt.plot(history.history['val_accuracy'], label='Val Acc')
+plt.title('Accuracy')
+plt.legend()
+plt.show()
+CELL6 # ==========================================
+# CELL 6: VISUALIZATION & SAVING (Matplotlib Version)
+# ==========================================
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc
+import numpy as np
+# 1. SAVE THE MODEL
+# -----------------
+try:
+model.save('Final_ECG_Model.keras')
+print("✅ Model Saved to disk!")
+except:
+print("⚠️ Could not save model (check permissions), but proceeding with graphs...")
+# 2. PLOT CONFUSION MATRIX
+# ----------------------------------
+print("\nGenerating Confusion Matrix...")
+Y_pred_classes = np.argmax(model.predict(X_test), axis=1)
+Y_true_classes = np.argmax(Y_test, axis=1)
+cm = confusion_matrix(Y_true_classes, Y_pred_classes)
+# Use Scikit-Learn's built-in plotter instead of Seaborn
+plt.figure(figsize=(10, 8))
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=TARGET_CLASSES)
+disp.plot(cmap='Blues', values_format='d')
+plt.title('Confusion Matrix', fontsize=16)
+plt.show()
+# 3. PLOT ROC CURVE
+# ------------------------------------
+print("Generating ROC Curve...")
+Y_pred_probs = model.predict(X_test)
+plt.figure(figsize=(10, 8))
+for i, class_name in enumerate(TARGET_CLASSES):
+fpr, tpr, _ = roc_curve(Y_test[:, i], Y_pred_probs[:, i])
+roc_auc = auc(fpr, tpr)
+plt.plot(fpr, tpr, lw=2, label=f'{class_name} (AUC = {roc_auc:.4f})')
+plt.plot([0, 1], [0, 1], 'k--', lw=2)
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve (AUC Score)', fontsize=16)
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.show()
+# CELL 7: SINGLE PATIENT DIAGNOSIS (The "Wow" Factor)
+# ==========================================
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+# 1. Pick a random patient from the Test Set
+patient_idx = random.randint(0, len(X_test) - 1)
+sample_signal = X_test[patient_idx]
+true_label_idx = np.argmax(Y_test[patient_idx])
+true_label_name = TARGET_CLASSES[true_label_idx]
+# 2. Ask the AI to Predict
+# Expand dims because model expects a batch (1, 500, 12)
+prediction_probs = model.predict(sample_signal[np.newaxis, ...])[0]
+predicted_label_idx = np.argmax(prediction_probs)
+predicted_label_name = TARGET_CLASSES[predicted_label_idx]
+confidence = np.max(prediction_probs) * 100
+# 3. Create the "Medical Report"
+plt.figure(figsize=(14, 6))
+# LEFT: Plot the ECG Signal (Lead II usually)
+plt.subplot(1, 2, 1)
+plt.plot(sample_signal[:, 1], color='black', linewidth=1.5) # Index 1 is often Lead II
+plt.title(f"Patient ECG Scan\nTrue Diagnosis: {true_label_name}", fontsize=14, fontweight='bold')
+plt.xlabel("Time (Samples)")
+plt.ylabel("Normalized Amplitude")
+plt.grid(True, alpha=0.3)
+if true_label_name == 'HC':
+plt.gca().set_facecolor('#f0fff0') # Light green background for Healthy
+else:
+plt.gca().set_facecolor('#fff0f0') # Light red background for Sick
+# RIGHT: Plot the AI Confidence
+plt.subplot(1, 2, 2)
+bars = plt.bar(TARGET_CLASSES, prediction_probs * 100, color='gray')
+# Highlight the winner
+bars[predicted_label_idx].set_color('blue')
+# Highlight the truth (if different)
+bars[true_label_idx].set_color('green')
+if predicted_label_idx != true_label_idx:
+bars[predicted_label_idx].set_color('red') # Wrong guess is red
+plt.title(f"AI Diagnosis: {predicted_label_name}\nConfidence: {confidence:.2f}%", fontsize=14, fontweight='bold')
+plt.ylim(0, 100)
+plt.ylabel("Confidence (%)")
+plt.tight_layout()
+plt.show()
+print(f"--- DIAGNOSIS REPORT ---")
+print(f"Patient ID: #{patient_idx}")
+print(f"Actual Condition: {true_label_name}")
+print(f"AI Prediction: {predicted_label_name}")
+print(f"AI Confidence: {confidence:.2f}%")
+if true_label_name == predicted_label_name:
+print("✅ CORRECT DIAGNOSIS")
+else:
+print("❌ INCORRECT DIAGNOSIS") # ==========================================
+# CELL 8: VERIFY & SAVE FULL REPORT
+# ==========================================
+import pandas as pd
+import numpy as np
+# 1. Check Total Test Count
+total_patients = len(X_test)
+print(f"✅ Total Patients in Test Set: {total_patients}")
+if total_patients < 100:
+print("⚠️ WARNING: Your test set is very small. Did you skip the Data Loading/Balancing steps?")
+else:
+print("This is a healthy size (should be around 1,700+).")
+# 2. Generate Full Report
+print("\nGenerating full report...")
+Y_pred_probs = model.predict(X_test, verbose=0)
+Y_pred_indices = np.argmax(Y_pred_probs, axis=1)
+Y_true_indices = np.argmax(Y_test, axis=1)
+results_df = pd.DataFrame({
+'Patient_ID_Index': range(total_patients),
+'True_Disease': [TARGET_CLASSES[i] for i in Y_true_indices],
+'AI_Prediction': [TARGET_CLASSES[i] for i in Y_pred_indices],
+'Confidence': [f"{np.max(p)*100:.2f}%" for p in Y_pred_probs],
+'Result': ['✅ Pass' if p == t else '❌ FAIL' for p, t in zip(Y_pred_indices, Y_true_indices)]
+})
+# 3. Save to CSV
+filename = 'Full_Patient_Diagnosis_Report.csv'
+results_df.to_csv(filename, index=False)
+print(f"\n📄 SUCCESS! Full report saved as '{filename}'")
+print(f"👉 Go to your folder (C:\\Users\\Jyothis P\\...) and open this Excel file.")
+print(f"👉 You will see ALL {total_patients} rows there, not just 9.")
+CNN-Bi LSTM with Attention Mechanism
+# ==========================================
+# CELL 1: SETUP & FUNCTIONS
+# ==========================================
+import os
+import re
+import random
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt, resample
+import pywt
+import wfdb
+import tensorflow as tf
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.utils import class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, Bidirectional, LSTM, Dense, Dropout, concatenate, BatchNormalization, Add
+from tensorflow.keras.utils import to_categorical
+import matplotlib.pyplot as plt
+!pip install charset_normalizer
+print("Libraries Imported Successfully!")
+# --- PATHS (Update if needed) ---
+ptb_base_dir = r'/Users/josedipu/Desktop/MAIN PROJECT/ptb-diagnostic-ecg-database-1.0.0/ptb-diagnostic-ecg-database-1.0.0'
+staffiii_dir = r'/Users/josedipu/Desktop/MAIN PROJECT/ptb-diagnostic-ecg-database-1.0.0/staff-iii-database-1.0.0/data'
+label_csv_path = r'/Users/josedipu/Desktop/MAIN PROJECT/Classified-Data-Sheet1.csv'
+# --- SIGNAL PROCESSING FUNCTIONS ---
+def bandpass_filter(data, lowcut, highcut, fs, order=4):
+nyq = 0.5 * fs
+low = lowcut / nyq
+high = highcut / nyq
+b, a = butter(order, [low, high], btype='band')
+y = filtfilt(b, a, data)
+return y
+def wavelet_denoise(data, wavelet='sym4', level=1):
+if np.all(data == 0) or np.std(data) == 0: return data
+coeff = pywt.wavedec(data, wavelet, mode='per')
+sigma = np.median(np.abs(coeff[-level])) / 0.6745
+if sigma == 0: return data
+uthresh = sigma * np.sqrt(2 * np.log(len(data)))
+coeff[1:] = [pywt.threshold(i, value=uthresh, mode='soft') for i in coeff[1:]]
+return pywt.waverec(coeff, wavelet, mode='per')
+def lms_filter(desired, input_signal, mu=0.01, filter_order=5):
+n_samples = len(input_signal)
+w = np.zeros(filter_order)
+y = np.zeros(n_samples)
+e = np.zeros(n_samples)
+epsilon = 1e-6
+for n in range(filter_order, n_samples):
+x = input_signal[n-filter_order:n][::-1]
+y[n] = np.dot(w, x)
+e[n] = desired[n] - y[n]
+norm_factor = np.dot(x, x) + epsilon
+w += (mu / norm_factor) * e[n] * x
+return e
+def segment_and_downsample(ecg_signal, original_fs=1000, target_fs=125, window_sec=4):
+num_samples = int(len(ecg_signal) * target_fs / original_fs)
+downsampled = resample(ecg_signal, num_samples)
+window_size = window_sec * target_fs
+num_windows = num_samples // window_size
+segments = []
+for i in range(num_windows):
+start = i * window_size
+end = start + window_size
+segments.append(downsampled[start:end])
+return np.array(segments)
+def preprocess_multilead(record_path, original_fs=1000, target_fs=125, window_sec=4, target_leads=12):
+try:
+record = wfdb.rdrecord(record_path)
+except:
+record = wfdb.rdrecord(record_path, channels=[0])
+available_leads = record.p_signal.shape[1]
+leads_to_process = min(available_leads, target_leads)
+all_lead_segments = []
+for lead in range(leads_to_process):
+ecg_signal = record.p_signal[:, lead]
+filtered_signal = bandpass_filter(ecg_signal, 0.5, 40, original_fs)
+denoised_signal = wavelet_denoise(filtered_signal)
+adapted_signal = lms_filter(denoised_signal, np.roll(denoised_signal, 1))
+segments = segment_and_downsample(adapted_signal, original_fs=original_fs, target_fs=target_fs, window_sec=window_sec)
+all_lead_segments.append(segments)
+if len(all_lead_segments) < target_leads:
+if len(all_lead_segments) > 0:
+num_segments = all_lead_segments[0].shape[0]
+window_size = all_lead_segments[0].shape[1]
+for _ in range(target_leads - len(all_lead_segments)):
+all_lead_segments.append(np.zeros((num_segments, window_size)))
+else:
+return np.array([])
+all_lead_segments = np.stack(all_lead_segments, axis=0)
+all_lead_segments = np.transpose(all_lead_segments, (1, 2, 0))
+return all_lead_segments
+# ==========================================
+# CELL 2: LOAD & PROCESS DATA (Takes Time)
+# ==========================================
+print("\n--- Starting Data Processing ---")
+# Load Labels
+ptb_label_df = pd.read_csv(label_csv_path)
+ptb_label_df.columns = ptb_label_df.columns.str.strip()
+ptb_label_map = dict(zip(ptb_label_df['Patient ID'], ptb_label_df['Label']))
+all_segments = []
+all_labels = []
+# --- Process PTB ---
+print("Processing PTB...")
+ptb_patient_dirs = [os.path.join(ptb_base_dir, d) for d in os.listdir(ptb_base_dir) if os.path.isdir(os.path.join(ptb_base_dir, d))]
+for patient_dir in ptb_patient_dirs:
+if "UnigramPreview" in patient_dir: continue
+folder_name = os.path.basename(patient_dir)
+match = re.search(r'\d+', folder_name)
+if not match: continue
+patient_id = int(match.group())
+records = [f[:-4] for f in os.listdir(patient_dir) if f.endswith('.dat')]
+if not records: continue
+try:
+segs = preprocess_multilead(os.path.join(patient_dir, records[0]))
+if len(segs) > 0:
+all_segments.append(segs)
+label = ptb_label_map.get(patient_id, 'Unknown')
+all_labels.extend([label] * segs.shape[0])
+print(f"Processed PTB Patient {patient_id}")
+except Exception as e:
+pass
+# --- Process STAFF III ---
+print("\nProcessing STAFF III...")
+if os.path.exists(staffiii_dir):
+data_path = os.path.join(staffiii_dir, 'data')
+search_path = data_path if os.path.exists(data_path) else staffiii_dir
+staff_files = sorted(list(set([f[:-4] for f in os.listdir(search_path) if f.endswith('.dat')])))
+count = 0
+for rec in staff_files:
+try:
+segs = preprocess_multilead(os.path.join(search_path, rec))
+if len(segs) > 0:
+all_segments.append(segs)
+all_labels.extend(['EMI'] * segs.shape[0])
+count += 1
+if count % 20 == 0: print(f"Processed {count} STAFF III files...")
+except:
+continue
+else:
+print("❌ Staff III path not found.")
+print("Processing Complete!")
+# ==========================================
+# CELL 3: CONSOLIDATE & BALANCE
+# ==========================================
+# 1. Consolidate Segments
+if 'all_segments' in locals() and len(all_segments) > 0:
+print("Consolidating segments...")
+X_combined = np.concatenate(all_segments, axis=0)
+else:
+raise ValueError("STOP! No segments found. Run Cell 2 again.")
+print(f"Initial Shape: {X_combined.shape}")
+print(f"Initial Label Count: {len(all_labels)}")
+# 2. Fix Labels ('0' -> 'HC')
+print("Fixing labels...")
+all_labels = ['HC' if x == '0' else x for x in all_labels]
+# 3. Balance (Downsample EMI)
+indices_emi = [i for i, label in enumerate(all_labels) if label == 'EMI']
+indices_others = [i for i, label in enumerate(all_labels) if label != 'EMI']
+if len(indices_emi) > 2000:
+print(f"Downsampling {len(indices_emi)} EMI samples to 1,500...")
+random.seed(42)
+selected_emi_indices = random.sample(indices_emi, 1500)
+balanced_indices = indices_others + selected_emi_indices
+random.shuffle(balanced_indices)
+# Apply Filter
+X_combined = X_combined[balanced_indices]
+all_labels = [all_labels[i] for i in balanced_indices]
+print(f"✅ Data Balanced! Final Size: {len(all_labels)}")
+else:
+print("Data balanced enough.")
+# ==========================================
+# CELL 4: PREPARE, CLEAN & BALANCE (Best Quality Data)
+# ==========================================
+import numpy as np
+import random
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.utils import class_weight
+print("--- 1. PREPARING DATA ---")
+# A. Consolidate (Safety Check)
+if 'X_combined' not in locals():
+if 'all_segments' in locals() and len(all_segments) > 0:
+X_combined = np.concatenate(all_segments, axis=0)
+else:
+raise ValueError("STOP! Data missing. Run Cell 2 (Loading) first.")
+# B. Clean NaNs (Critical)
+if np.isnan(X_combined).any():
+print("⚠️ Cleaning NaNs...")
+X_combined = np.nan_to_num(X_combined)
+# C. BALANCE DATA (Downsample EMI)
+all_labels = ['HC' if x == '0' else x for x in all_labels]
+indices_emi = [i for i, label in enumerate(all_labels) if label == 'EMI']
+indices_others = [i for i, label in enumerate(all_labels) if label != 'EMI']
+if len(indices_emi) > 2000:
+print(f"Downsampling {len(indices_emi)} EMI samples to 1,500...")
+random.seed(42)
+selected_emi_indices = random.sample(indices_emi, 1500)
+balanced_indices = indices_others + selected_emi_indices
+random.shuffle(balanced_indices)
+X_balanced = X_combined[balanced_indices]
+Y_balanced = [all_labels[i] for i in balanced_indices]
+else:
+X_balanced = X_combined
+Y_balanced = all_labels
+print(f"Balanced Data Size: {len(Y_balanced)}")
+# D. FIX UNITS (Per-Sample Normalization - The Key to Success)
+print("--- FIXING UNITS ---")
+epsilon = 1e-8
+# Normalize each heartbeat individually so Units don't matter
+mean_val = np.mean(X_balanced, axis=1, keepdims=True)
+std_val = np.std(X_balanced, axis=1, keepdims=True)
+X_normalized = (X_balanced - mean_val) / (std_val + epsilon)
+# E. ENCODE & SPLIT
+le = LabelEncoder()
+Y_integers = le.fit_transform(Y_balanced)
+Y_onehot = to_categorical(Y_integers)
+TARGET_CLASSES = list(le.classes_)
+print(f"Classes: {TARGET_CLASSES}")
+X_train, X_test, Y_train, Y_test = train_test_split(X_normalized, Y_onehot, test_size=0.2, random_state=42, stratify=Y_onehot)
+X_train, X_val, Y_train, Y_val = train_test_split(X_train, Y_train, test_size=0.2, random_state=42, stratify=Y_train)
+# Weights
+Y_train_int = np.argmax(Y_train, axis=1)
+class_labels_int = np.unique(Y_train_int)
+weights = class_weight.compute_class_weight(class_weight='balanced', classes=class_labels_int, y=Y_train_int)
+class_weights_dict = dict(zip(class_labels_int, weights))
+print("✅ READY! Run Cell 5 now.")
+# ==========================================
+# CELL 5: CNN-Bilstm with attention
+# ==========================================
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, Bidirectional, LSTM, Dense, Dropout, concatenate, BatchNormalization, Add, Layer
+from tensorflow.keras import backend as K
+from sklearn.metrics import classification_report
+import matplotlib.pyplot as plt
+import numpy as np
+# Attention Layer Definition
+class AttentionLayer(Layer):
+def __init__(self, **kwargs):
+super(AttentionLayer, self).__init__(**kwargs)
+def build(self, input_shape):
+self.W = self.add_weight(name='att_weight', shape=(input_shape[-1], 1),
+initializer='random_normal', trainable=True)
+self.b = self.add_weight(name='att_bias', shape=(input_shape[1], 1),
+initializer='zeros', trainable=True)
+super(AttentionLayer, self).build(input_shape)
+def call(self, inputs):
+e = K.tanh(K.dot(inputs, self.W) + self.b) # Shape: (batch, time_steps, 1)
+e = K.squeeze(e, axis=-1) # Shape: (batch, time_steps)
+alpha = K.softmax(e) # Shape: (batch, time_steps)
+alpha_expanded = K.expand_dims(alpha, axis=-1) # (batch, time_steps, 1)
+weighted_sum = K.sum(inputs * alpha_expanded, axis=1) # (batch, features)
+return weighted_sum
+def compute_output_shape(self, input_shape):
+return (input_shape[0], input_shape[2])
+# Model Building Function with Attention
+def build_msar_net_attention(input_shape, num_classes):
+input_tensor = Input(shape=input_shape)
+# CNN Block (multi-scale kernels)
+conv1 = Conv1D(32, 5, activation='relu', padding='same')(input_tensor)
+bn1 = BatchNormalization()(conv1)
+conv2 = Conv1D(32, 25, activation='relu', padding='same')(input_tensor)
+bn2 = BatchNormalization()(conv2)
+merged = concatenate([bn1, bn2], axis=-1)
+# Residual block
+res = Conv1D(64, 1, activation='relu', padding='same')(input_tensor)
+conv_out = Add()([merged, res])
+conv_out = Dropout(0.3)(conv_out)
+# BiLSTM Layers with return_sequences for attention input
+lstm1 = Bidirectional(LSTM(64, return_sequences=True))(conv_out)
+lstm2 = Bidirectional(LSTM(32, return_sequences=True))(lstm1)
+lstm2 = Dropout(0.3)(lstm2)
+# Attention layer
+attention_output = AttentionLayer()(lstm2)
+# Dense and output
+dense_intermediate = Dense(64, activation='relu')(attention_output)
+output = Dense(num_classes, activation='softmax')(dense_intermediate)
+return Model(inputs=input_tensor, outputs=output)
+# Instantiate model
+INPUT_SHAPE = (X_train.shape[1], X_train.shape[2])
+model_attention = build_msar_net_attention(INPUT_SHAPE, len(TARGET_CLASSES))
+# Compile model
+model_attention.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+# Callbacks setup (same as before)
+callbacks = [
+tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1, min_lr=0.00001),
+tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
+tf.keras.callbacks.ModelCheckpoint('best_ecg_model_attention.keras', monitor='val_loss', save_best_only=True, verbose=1)
+]
+# Train model
+print(f"\n--- Training on {len(X_train)} samples ---")
+history = model_attention.fit(
+X_train, Y_train,
+epochs=50,
+batch_size=32,
+validation_data=(X_val, Y_val),
+class_weight=class_weights_dict,
+callbacks=callbacks,
+verbose=1
+)
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import roc_curve, auc
+from sklearn.preprocessing import label_binarize
+import matplotlib.pyplot as plt
+import numpy as np
+# Evaluate on test data
+print("\n--- Final Results ---")
+loss, acc = model_attention.evaluate(X_test, Y_test, verbose=0)
+print(f"Test Accuracy: {acc:.4f}")
+# Predictions and classification report
+Y_pred = np.argmax(model_attention.predict(X_test), axis=1)
+Y_true = np.argmax(Y_test, axis=1)
+print("\nClassification Report:")
+print(classification_report(Y_true, Y_pred, target_names=TARGET_CLASSES))
+# Plot training history: Loss and Accuracy
+plt.figure(figsize=(14, 5))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.title('Training and Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='Train Accuracy')
+plt.plot(history.history['val_accuracy'], label='Val Accuracy')
+plt.title('Training and Validation Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.show()
+# Predict class indices
+Y_pred = np.argmax(model_attention.predict(X_test), axis=1)
+Y_true = np.argmax(Y_test, axis=1)
+# Create confusion matrix
+cm = confusion_matrix(Y_true, Y_pred)
+# Plot confusion matrix (annotated)
+plt.figure(figsize=(8,6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+xticklabels=TARGET_CLASSES,
+yticklabels=TARGET_CLASSES)
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.title('Confusion Matrix')
+plt.show()
+# Predict probabilities for test set
+Y_score = model_attention.predict(X_test)
+# True labels and binarization
+Y_true = np.argmax(Y_test, axis=1)
+Y_test_bin = Y_test # Already one-hot encoded
+n_classes = len(TARGET_CLASSES)
+# Plot ROC curve for each class
+fpr = dict()
+tpr = dict()
+roc_auc = dict()
+for i in range(n_classes):
+fpr[i], tpr[i], _ = roc_curve(Y_test_bin[:, i], Y_score[:, i])
+roc_auc[i] = auc(fpr[i], tpr[i])
+plt.figure(figsize=(10,8))
+for i in range(n_classes):
+plt.plot(fpr[i], tpr[i], label=f'{TARGET_CLASSES[i]} (AUC = {roc_auc[i]:.2f})')
+plt.plot([0, 1], [0, 1], 'k--', lw=2) # Diagonal for random guess
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curves for Each Class')
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.show()
