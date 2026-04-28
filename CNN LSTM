@@ -1,0 +1,355 @@
+CNN-LSTM
+# ==========================================
+# CELL 1: SETUP & FUNCTIONS
+# ==========================================
+import os
+import re
+import random
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt, resample
+import pywt
+import wfdb
+import tensorflow as tf
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.utils import class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+from tensorflow.keras.models import Model
+# Note: LSTM and Conv1D are standard layers, Bidirectional is removed for the simpler model
+from tensorflow.keras.layers import Input, Conv1D, LSTM, Dense, Dropout, concatenate, BatchNormalization, Add
+from tensorflow.keras.utils import to_categorical
+import matplotlib.pyplot as plt
+print("Libraries Imported Successfully!")
+# --- PATHS (UPDATE THESE PATHS) ---
+# Ensure these paths are CORRECT and ACCESSIBLE
+ptb_base_dir = r'C:\Users\joshu\OneDrive\Documents\PTB-Database'
+staffiii_dir = r'C:\Users\joshu\OneDrive\Documents\staff-iii-database-1.0.0\data'
+label_csv_path = r'C:\Users\joshu\OneDrive\Documents\data.csv'
+# --- SIGNAL PROCESSING FUNCTIONS ---
+def bandpass_filter(data, lowcut, highcut, fs, order=4):
+nyq = 0.5 * fs
+low = lowcut / nyq
+high = highcut / nyq
+b, a = butter(order, [low, high], btype='band')
+y = filtfilt(b, a, data)
+return y
+def wavelet_denoise(data, wavelet='sym4', level=1):
+if np.all(data == 0) or np.std(data) == 0: return data
+coeff = pywt.wavedec(data, wavelet, mode='per')
+sigma = np.median(np.abs(coeff[-level])) / 0.6745
+if sigma == 0: return data
+uthresh = sigma * np.sqrt(2 * np.log(len(data)))
+coeff[1:] = [pywt.threshold(i, value=uthresh, mode='soft') for i in coeff[1:]]
+return pywt.waverec(coeff, wavelet, mode='per')
+def lms_filter(desired, input_signal, mu=0.01, filter_order=5):
+n_samples = len(input_signal)
+w = np.zeros(filter_order)
+y = np.zeros(n_samples)
+e = np.zeros(n_samples)
+epsilon = 1e-6
+for n in range(filter_order, n_samples):
+x = input_signal[n-filter_order:n][::-1]
+y[n] = np.dot(w, x)
+e[n] = desired[n] - y[n]
+norm_factor = np.dot(x, x) + epsilon
+w += (mu / norm_factor) * e[n] * x
+return e
+def segment_and_downsample(ecg_signal, original_fs=1000, target_fs=125, window_sec=4):
+num_samples = int(len(ecg_signal) * target_fs / original_fs)
+downsampled = resample(ecg_signal, num_samples)
+window_size = window_sec * target_fs
+num_windows = num_samples // window_size
+segments = []
+for i in range(num_windows):
+start = i * window_size
+end = start + window_size
+segments.append(downsampled[start:end])
+return np.array(segments)
+def preprocess_multilead(record_path, original_fs=1000, target_fs=125, window_sec=4, target_leads=12):
+try:
+record = wfdb.rdrecord(record_path)
+except:
+record = wfdb.rdrecord(record_path, channels=[0])
+available_leads = record.p_signal.shape[1]
+leads_to_process = min(available_leads, target_leads)
+all_lead_segments = []
+for lead in range(leads_to_process):
+ecg_signal = record.p_signal[:, lead]
+filtered_signal = bandpass_filter(ecg_signal, 0.5, 40, original_fs)
+denoised_signal = wavelet_denoise(filtered_signal)
+adapted_signal = lms_filter(denoised_signal, np.roll(denoised_signal, 1))
+segments = segment_and_downsample(adapted_signal, original_fs=original_fs, target_fs=target_fs, window_sec=window_sec)
+all_lead_segments.append(segments)
+if len(all_lead_segments) < target_leads:
+if len(all_lead_segments) > 0:
+num_segments = all_lead_segments[0].shape[0]
+window_size = all_lead_segments[0].shape[1]
+for _ in range(target_leads - len(all_lead_segments)):
+all_lead_segments.append(np.zeros((num_segments, window_size)))
+else:
+return np.array([])
+all_lead_segments = np.stack(all_lead_segments, axis=0)
+# Output Shape: (Num Segments, Window Size, Num Leads) for Conv1D compatibility
+all_lead_segments = np.transpose(all_lead_segments, (1, 2, 0))
+return all_lead_segments
+# ==========================================
+# CELL 2: LOAD & PROCESS DATA (Takes Time)
+# ==========================================
+print("\n--- Starting Data Processing ---")
+# Load Labels from CSV
+ptb_label_df = pd.read_csv(label_csv_path)
+ptb_label_df.columns = ptb_label_df.columns.str.strip()
+ptb_label_map = dict(zip(ptb_label_df['Patient ID'], ptb_label_df['Label']))
+all_segments = []
+all_labels = []
+# --- Process PTB ---
+print("Processing PTB...")
+ptb_patient_dirs = [os.path.join(ptb_base_dir, d) for d in os.listdir(ptb_base_dir) if os.path.isdir(os.path.join(ptb_base_dir, d))]
+for patient_dir in ptb_patient_dirs:
+if "UnigramPreview" in patient_dir: continue
+folder_name = os.path.basename(patient_dir)
+match = re.search(r'\d+', folder_name)
+if not match: continue
+patient_id = int(match.group())
+records = [f[:-4] for f in os.listdir(patient_dir) if f.endswith('.dat')]
+if not records: continue
+try:
+# segs shape: (Num Segments, Window Size, Num Leads)
+segs = preprocess_multilead(os.path.join(patient_dir, records[0]))
+if len(segs) > 0:
+all_segments.append(segs)
+label = ptb_label_map.get(patient_id, 'Unknown')
+all_labels.extend([label] * segs.shape[0])
+# print(f"Processed PTB Patient {patient_id}")
+except Exception as e:
+pass
+# --- Process STAFF III ---
+print("\nProcessing STAFF III...")
+if os.path.exists(staffiii_dir):
+data_path = os.path.join(staffiii_dir, 'data')
+search_path = data_path if os.path.exists(data_path) else staffiii_dir
+staff_files = sorted(list(set([f[:-4] for f in os.listdir(search_path) if f.endswith('.dat')])))
+count = 0
+for rec in staff_files:
+try:
+segs = preprocess_multilead(os.path.join(search_path, rec))
+if len(segs) > 0:
+all_segments.append(segs)
+all_labels.extend(['EMI'] * segs.shape[0]) # Assuming all STAFF III are Early MI
+count += 1
+if count % 20 == 0: print(f"Processed {count} STAFF III files...")
+except:
+continue
+else:
+print("❌ Staff III path not found.")
+print("Processing Complete!")
+# ==========================================
+# CELL 3: CONSOLIDATE & BALANCE
+# ==========================================
+print("\n--- 3. Consolidate & Balance ---")
+# 1. Consolidate Segments
+if 'all_segments' in locals() and len(all_segments) > 0:
+print("Consolidating segments...")
+X_combined = np.concatenate(all_segments, axis=0)
+else:
+raise ValueError("STOP! No segments found. Run Cell 2 again.")
+print(f"Initial Shape: {X_combined.shape}")
+print(f"Initial Label Count: {len(all_labels)}")
+# 2. Fix Labels ('0' -> 'HC')
+print("Fixing labels...")
+all_labels = ['HC' if x == '0' else x for x in all_labels]
+# 3. Balance (Downsample EMI - to reduce the dominant class)
+indices_emi = [i for i, label in enumerate(all_labels) if label == 'EMI']
+indices_others = [i for i, label in enumerate(all_labels) if label != 'EMI']
+if len(indices_emi) > 2000:
+print(f"Downsampling {len(indices_emi)} EMI samples to 1,500...")
+random.seed(42)
+selected_emi_indices = random.sample(indices_emi, 1500)
+balanced_indices = indices_others + selected_emi_indices
+random.shuffle(balanced_indices)
+#Apply Filter
+X_combined = X_combined[balanced_indices]
+all_labels = [all_labels[i] for i in balanced_indices]
+print(f"✅ Data Balanced! Final Size: {len(all_labels)}")
+else:
+print("Data balanced enough.")
+# ==========================================
+# CELL 4: PREPARE, CLEAN & SPLIT (Best Quality Data)
+# ==========================================
+import numpy as np
+import random
+import collections
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.utils import class_weight
+print("\n--- 4. PREPARING DATA FOR MODEL ---")
+# A. Consolidate (Safety Check)
+if 'X_combined' not in locals() or len(X_combined) == 0:
+if 'all_segments' in locals() and len(all_segments) > 0:
+X_combined = np.concatenate(all_segments, axis=0)
+else:
+raise ValueError("STOP! Data missing. Rerun Cell 2 (Loading) first.")
+# B. Clean NaNs (Critical)
+if np.isnan(X_combined).any():
+print("⚠️ Cleaning NaNs...")
+X_combined = np.nan_to_num(X_combined)
+# C. Balance (Re-run for safety)
+indices_emi = [i for i, label in enumerate(all_labels) if label == 'EMI']
+indices_others = [i for i, label in enumerate(all_labels) if label != 'EMI']
+if len(indices_emi) > 2000:
+random.seed(42)
+selected_emi_indices = random.sample(indices_emi, 1500)
+balanced_indices = indices_others + selected_emi_indices
+random.shuffle(balanced_indices)
+X_balanced = X_combined[balanced_indices]
+Y_balanced = [all_labels[i] for i in balanced_indices]
+else:
+X_balanced = X_combined
+Y_balanced = all_labels
+# D. FIX UNITS (Per-Sample Normalization - The Key to Success)
+print("--- FIXING UNITS (Normalizing) ---")
+epsilon = 1e-8
+# Normalize each segment/heartbeat individually
+mean_val = np.mean(X_balanced, axis=(1, 2), keepdims=True)
+std_val = np.std(X_balanced, axis=(1, 2), keepdims=True)
+X_normalized = (X_balanced - mean_val) / (std_val + epsilon)
+# E. ENCODE & SPLIT
+le = LabelEncoder()
+Y_integers = le.fit_transform(Y_balanced)
+Y_onehot = to_categorical(Y_integers)
+TARGET_CLASSES = list(le.classes_)
+print(f"Classes: {TARGET_CLASSES}")
+# Split 80% Train/Val, 20% Test
+X_train_val, X_test, Y_train_val, Y_test = train_test_split(X_normalized, Y_onehot, test_size=0.2, random_state=42, stratify=Y_onehot)
+# Split 80% Train, 20% Val
+X_train, X_val, Y_train, Y_val = train_test_split(X_train_val, Y_train_val, test_size=0.2, random_state=42, stratify=Y_train_val)
+print(f"Train/Val/Test Shapes: {X_train.shape[0]}/{X_val.shape[0]}/{X_test.shape[0]}")
+# F. Weights
+Y_train_int = np.argmax(Y_train, axis=1)
+class_labels_int = np.unique(Y_train_int)
+weights = class_weight.compute_class_weight(class_weight='balanced', classes=class_labels_int, y=Y_train_int)
+class_weights_dict = dict(zip(class_labels_int, weights))
+class_dist = collections.Counter(Y_train_int)
+print(f"Train Class Distribution (Int): {class_dist}")
+print("✅ Data fully prepared! Run Cell 5 now.")
+# ==========================================
+# CELL 5: TRAIN PURE CNN-LSTM
+# ==========================================
+import numpy as np # Needed for argmax
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, LSTM, Dense, Dropout, concatenate, BatchNormalization
+from sklearn.metrics import classification_report, confusion_matrix
+# 1. DEFINE MODEL (Simplified CNN-LSTM)
+def build_cnn_lstm_net(input_shape, num_classes):
+input_tensor = Input(shape=input_shape)
+# CNN Feature Extraction Block (Multi-scale)
+conv1 = Conv1D(32, 5, activation='relu', padding='same')(input_tensor)
+bn1 = BatchNormalization()(conv1)
+conv2 = Conv1D(32, 25, activation='relu', padding='same')(input_tensor)
+bn2 = BatchNormalization()(conv2)
+merged_cnn_out = concatenate([bn1, bn2], axis=-1)
+merged_cnn_out = Dropout(0.3)(merged_cnn_out) # Combined CNN output
+# LSTM Block (Single-Directional)
+lstm1 = LSTM(64, return_sequences=True)(merged_cnn_out)
+lstm2 = LSTM(32)(lstm1) # Final feature vector from sequence
+lstm2 = Dropout(0.3)(lstm2)
+# Output
+out = Dense(num_classes, activation='softmax')(Dense(64, activation='relu')(lstm2))
+return Model(inputs=input_tensor, outputs=out)
+# 2. COMPILE
+INPUT_SHAPE = (X_train.shape[1], X_train.shape[2])
+model = build_cnn_lstm_net(INPUT_SHAPE, len(TARGET_CLASSES))
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+print("\n--- Model Summary (CNN + Standard LSTM) ---")
+model.summary()
+# 3. CALLBACKS
+callbacks = [
+tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1, min_lr=0.00001),
+tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
+tf.keras.callbacks.ModelCheckpoint('best_ecg_model_simple.keras', monitor='val_loss', save_best_only=True, verbose=1)
+]
+# 4. TRAIN
+print(f"\n--- Training on {len(X_train)} samples ---")
+history = model.fit(
+X_train, Y_train,
+epochs=50,
+batch_size=32,
+validation_data=(X_val, Y_val),
+class_weight=class_weights_dict,
+callbacks=callbacks,
+verbose=1
+)
+# 5. EVALUATE
+print("\n--- Final Results ---")
+loss, acc = model.evaluate(X_test, Y_test, verbose=0)
+print(f"Test Accuracy: {acc:.4f}")
+Y_pred = np.argmax(model.predict(X_test), axis=1)
+Y_true = np.argmax(Y_test, axis=1)
+print("\nClassification Report:")
+print(classification_report(Y_true, Y_pred, target_names=TARGET_CLASSES))
+# 6. PLOT GRAPHS
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.title('Loss')
+plt.legend()
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='Train Acc')
+plt.plot(history.history['val_accuracy'], label='Val Acc')
+plt.title('Accuracy')
+plt.legend()
+plt.show()
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import re
+# 1. Input your log data here
+raw_data = """Epoch 1/5036/36 ... [PASTE YOUR FULL LOGS HERE] ..."""
+# 2. Parse the data
+data = []
+lines = raw_data.strip().split('\n')
+for line in lines:
+acc_match = re.search(r'accuracy: (\d+\.\d+)', line)
+loss_match = re.search(r'loss: (\d+\.\d+)', line)
+val_acc_match = re.search(r'val_accuracy: (\d+\.\d+)', line)
+val_loss_match = re.search(r'val_loss: (\d+\.\d+)', line)
+if acc_match and loss_match and val_acc_match and val_loss_match:
+data.append({
+'accuracy': float(acc_match.group(1)),
+'loss': float(loss_match.group(1)),
+'val_accuracy': float(val_acc_match.group(1)),
+'val_loss': float(val_loss_match.group(1))
+})
+df = pd.DataFrame(data)
+df['epoch'] = range(1, len(df) + 1)
+# 3. Create Grouped Bar Charts
+fig, ax = plt.subplots(2, 1, figsize=(14, 10))
+# Setup for bars
+x = np.arange(len(df))
+width = 0.35
+# --- Plot 1: Accuracy ---
+ax[0].bar(x - width/2, df['accuracy'], width, label='Train Accuracy', color='skyblue')
+ax[0].bar(x + width/2, df['val_accuracy'], width, label='Val Accuracy', color='orange')
+ax[0].set_ylabel('Accuracy')
+ax[0].set_title('Training vs Validation Accuracy')
+ax[0].set_xticks(x)
+ax[0].set_xticklabels(df['epoch'], rotation=90, fontsize=8)
+ax[0].legend()
+ax[0].grid(axis='y', alpha=0.5)
+# --- Plot 2: Loss ---
+ax[1].bar(x - width/2, df['loss'], width, label='Train Loss', color='lightgreen')
+ax[1].bar(x + width/2, df['val_loss'], width, label='Val Loss', color='salmon')
+ax[1].set_ylabel('Loss')
+ax[1].set_title('Training vs Validation Loss')
+ax[1].set_xticks(x)
+ax[1].set_xticklabels(df['epoch'], rotation=90, fontsize=8)
+ax[1].set_xlabel('Epochs')
+ax[1].legend()
+ax[1].grid(axis='y', alpha=0.5)
+plt.tight_layout()
+plt.show()
