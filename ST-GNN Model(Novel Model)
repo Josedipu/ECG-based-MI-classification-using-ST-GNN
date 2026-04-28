@@ -1,0 +1,416 @@
+ST_GNN
+==========================================
+# CELL 1: SETUP & FUNCTIONS
+# ====#======================================
+import os
+import re
+import random
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt, resample
+import pywt
+import wfdb
+import tensorflow as tf
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.utils import class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, Bidirectional, LSTM, Dense, Dropout, concatenate, BatchNormalization, Add
+from tensorflow.keras.utils import to_categorical
+import matplotlib.pyplot as plt
+print("Libraries Imported Successfully!")
+# --- PATHS (Update if needed) ---
+ptb_base_dir = r'D:\Jose PRoject\ECG_dataset_S8_ECB\ptb-diagnostic-ecg-database-1.0.0'
+staffiii_dir = r'D:\Jose PRoject\ECG_dataset_S8_ECB\staff-iii-database-1.0.0\data'
+label_csv_path = r'D:\Jose PRoject\ECG_dataset_S8_ECB\Classified Data.csv'
+# --- SIGNAL PROCESSING FUNCTIONS ---
+def bandpass_filter(data, lowcut, highcut, fs, order=4):
+nyq = 0.5 * fs
+low = lowcut / nyq
+high = highcut / nyq
+b, a = butter(order, [low, high], btype='band')
+y = filtfilt(b, a, data)
+return y
+def wavelet_denoise(data, wavelet='sym4', level=1):
+if np.all(data == 0) or np.std(data) == 0: return data
+coeff = pywt.wavedec(data, wavelet, mode='per')
+sigma = np.median(np.abs(coeff[-level])) / 0.6745
+if sigma == 0: return data
+uthresh = sigma * np.sqrt(2 * np.log(len(data)))
+coeff[1:] = [pywt.threshold(i, value=uthresh, mode='soft') for i in coeff[1:]]
+return pywt.waverec(coeff, wavelet, mode='per')
+def lms_filter(desired, input_signal, mu=0.01, filter_order=5):
+n_samples = len(input_signal)
+w = np.zeros(filter_order)
+y = np.zeros(n_samples)
+e = np.zeros(n_samples)
+epsilon = 1e-6
+for n in range(filter_order, n_samples):
+x = input_signal[n-filter_order:n][::-1]
+y[n] = np.dot(w, x)
+e[n] = desired[n] - y[n]
+norm_factor = np.dot(x, x) + epsilon
+w += (mu / norm_factor) * e[n] * x
+return e
+def segment_and_downsample(ecg_signal, original_fs=1000, target_fs=125, window_sec=4):
+num_samples = int(len(ecg_signal) * target_fs / original_fs)
+downsampled = resample(ecg_signal, num_samples)
+window_size = window_sec * target_fs
+num_windows = num_samples // window_size
+segments = []
+for i in range(num_windows):
+start = i * window_size
+end = start + window_size
+segments.append(downsampled[start:end])
+return np.array(segments)
+def preprocess_multilead(record_path, original_fs=1000, target_fs=125, window_sec=4, target_leads=12):
+try:
+record = wfdb.rdrecord(record_path)
+except:
+record = wfdb.rdrecord(record_path, channels=[0])
+available_leads = record.p_signal.shape[1]
+leads_to_process = min(available_leads, target_leads)
+all_lead_segments = []
+for lead in range(leads_to_process):
+ecg_signal = record.p_signal[:, lead]
+filtered_signal = bandpass_filter(ecg_signal, 0.5, 40, original_fs)
+denoised_signal = wavelet_denoise(filtered_signal)
+adapted_signal = lms_filter(denoised_signal, np.roll(denoised_signal, 1))
+segments = segment_and_downsample(adapted_signal, original_fs=original_fs, target_fs=target_fs, window_sec=window_sec)
+all_lead_segments.append(segments)
+if len(all_lead_segments) < target_leads:
+if len(all_lead_segments) > 0:
+num_segments = all_lead_segments[0].shape[0]
+window_size = all_lead_segments[0].shape[1]
+for _ in range(target_leads - len(all_lead_segments)):
+all_lead_segments.append(np.zeros((num_segments, window_size)))
+else:
+return np.array([])
+all_lead_segments = np.stack(all_lead_segments, axis=0)
+all_lead_segments = np.transpose(all_lead_segments, (1, 2, 0))
+return all_lead_segments
+# --- 2. Process PTB Database (REVISED CATCH-ALL) ---
+print("Processing PTB...")
+all_segments = []
+all_labels = []
+all_patient_ids = []
+# Get folders
+ptb_folders = [f for f in os.listdir(ptb_base_dir) if f.startswith('patient')]
+for i, folder in enumerate(ptb_folders):
+match = re.search(r'\d+', folder)
+if not match: continue
+patient_id = int(match.group())
+# Check the map we cleaned earlier
+label = ptb_label_map.get(patient_id, 'Unknown')
+if label == 'Unknown':
+# If we skip, let's find out why for the first few
+if i < 10: print(f"Skipping Patient {patient_id}: No label found in CSV.")
+continue
+patient_dir = os.path.join(ptb_base_dir, folder)
+# Find ALL .dat files for this patient
+records = [f[:-4] for f in os.listdir(patient_dir) if f.endswith('.dat')]
+if records:
+try:
+# Process the first record
+segs = preprocess_multilead(os.path.join(patient_dir, records[0]))
+if len(segs) > 0:
+all_segments.append(segs)
+all_labels.extend([label] * segs.shape[0])
+all_patient_ids.extend([patient_id] * segs.shape[0])
+except Exception as e:
+print(f"Error processing Patient {patient_id}: {e}")
+continue
+print("\n--- PTB Phase Complete ---")
+print(pd.Series(all_labels).value_counts())
+# Create a mapping that handles both integers and strings
+ptb_label_map = dict(zip(ptb_label_df['Patient ID'].astype(str), ptb_label_df['Label']))
+# Add the integer version too just in case
+for pid, lbl in zip(ptb_label_df['Patient ID'], ptb_label_df['Label']):
+ptb_label_map[int(pid)] = lbl
+# Re-run a quick scan for the missing classes
+# (Only if you are missing data - if you already have X saved, we can just re-map)
+# --- 3. Process STAFF III (EMI) ---
+print("\nProcessing STAFF III...")
+sys.stdout.flush()
+if os.path.exists(staffiii_dir):
+# Get all valid record names
+staff_files = sorted(list(set([f[:-4] for f in os.listdir(staffiii_dir) if f.endswith('.dat')])))
+emi_count = 0
+for count, rec in enumerate(staff_files):
+if emi_count >= 1500: break # Limit EMI segments to keep dataset balanced
+try:
+# Reuse your preprocessing function
+segs = preprocess_multilead(os.path.join(staffiii_dir, rec))
+if len(segs) > 0:
+# Calculate how many segments we still need
+take = min(len(segs), 1500 - emi_count)
+# IMPORTANT: Append to the SAME lists used by PTB
+all_segments.extend(segs[:take])
+all_labels.extend(['EMI'] * take)
+all_patient_ids.extend([f"staff_{count}"] * take)
+emi_count += take
+if (emi_count) % 500 == 0 and emi_count > 0:
+print(f" > STAFF III: {emi_count} EMI segments collected...")
+sys.stdout.flush()
+except Exception:
+continue
+print(f"✅ STAFF III Processing Complete. Collected {emi_count} segments.")
+else:
+print(f"⚠️ Warning: STAFF III Path not found at {staffiii_dir}")
+# --- 4. FINALIZING ---
+if len(all_segments) == 0:
+print("❌ CRITICAL ERROR: No data loaded from either database.")
+else:
+# Combine all segment batches into one large 3D array (Samples, Time, Leads)
+X = np.concatenate(all_segments, axis=0)
+X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+# 🚨 THE SYNC FIX: Ensure labels and signals match 1-to-1
+# This prevents the 'ValueError: x and y must have same first dimension'
+min_len = min(len(X), len(all_labels), len(all_patient_ids))
+X = X[:min_len]
+all_labels = all_labels[:min_len]
+all_patient_ids = all_patient_ids[:min_len]
+print("\n" + "="*40)
+print(f"✅ FINAL DATASET PREPARED")
+print(f"Total Array Shape: {X.shape}")
+print(f"Unique Classes Found: {np.unique(all_labels)}")
+print("-" * 40)
+print("Class Distribution:")
+print(pd.Series(all_labels).value_counts())
+print("="*40)
+# Clean the Mapping
+cleaned_map = {}
+for pid, lbl in ptb_label_map.items():
+if pd.isna(lbl): continue # Skip nan
+# Convert '0' label to 'HC' (assuming 0 is healthy)
+str_label = str(lbl).strip()
+if str_label == '0':
+str_label = 'HC'
+# Map the ID as an integer so it matches int(match.group())
+try:
+cleaned_map[int(float(pid))] = str_label
+except:
+continue
+ptb_label_map = cleaned_map
+print("Fixed Mapping Counts:", Counter(ptb_label_map.values()))
+import numpy as np
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.utils import to_categorical
+# --- 0. SAFETY SYNCHRONIZATION ---
+min_samples = min(X.shape[0], len(y_list), len(groups_list))
+X = X[:min_samples]
+y_list = np.array(y_list[:min_samples])
+groups_list = np.array(groups_list[:min_samples])
+print(f"Data Synchronized: {X.shape[0]} samples with {len(y_list)} labels.")
+# --- 1. NESTED LEAK-PROOF SPLIT (70/15/15) ---
+# Step A: Split 70% Train and 30% Temporary (Val + Test)
+gss_train = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=42)
+train_idx, temp_idx = next(gss_train.split(X, y_list, groups=groups_list))
+# Step B: Split the 30% Temporary into two equal 15% halves (0.5 of 0.3 = 0.15)
+X_temp, y_temp_raw = X[temp_idx], y_list[temp_idx]
+groups_temp = groups_list[temp_idx]
+gss_val_test = GroupShuffleSplit(n_splits=1, test_size=0.5, random_state=42)
+val_sub_idx, test_sub_idx = next(gss_val_test.split(X_temp, y_temp_raw, groups=groups_temp))
+# Map sub-indices back to the original index space for clarity
+val_idx = temp_idx[val_sub_idx]
+test_idx = temp_idx[test_sub_idx]
+# Create final arrays
+X_train, y_train_raw = X[train_idx], y_list[train_idx]
+X_val, y_val_raw = X[val_idx], y_list[val_idx]
+X_test, y_test_raw = X[test_idx], y_list[test_idx]
+# --- 2. ENCODING ---
+le = LabelEncoder()
+le.fit(y_list)
+num_classes = len(le.classes_)
+y_train = to_categorical(le.transform(y_train_raw), num_classes)
+y_val = to_categorical(le.transform(y_val_raw), num_classes)
+y_test = to_categorical(le.transform(y_test_raw), num_classes)
+# --- 3. LEAKAGE AUDIT ---
+train_patients = set(groups_list[train_idx])
+val_patients = set(groups_list[val_idx])
+test_patients = set(groups_list[test_idx])
+# Check for any intersection between sets
+leak_train_val = train_patients.intersection(val_patients)
+leak_val_test = val_patients.intersection(test_patients)
+leak_train_test = train_patients.intersection(test_patients)
+num_leaked = len(leak_train_val) + len(leak_val_test) + len(leak_train_test)
+print("-" * 30)
+print(f"Final Shapes:")
+print(f" > Train: {X_train.shape} | Labels: {y_train.shape}")
+print(f" > Val: {X_val.shape} | Labels: {y_val.shape}")
+print(f" > Test: {X_test.shape} | Labels: {y_test.shape}")
+print("-" * 30)
+if num_leaked == 0:
+print(f"✅ SUCCESS: No data leakage detected in 70/15/15 split!")
+print(f"Unique Patients -> Train: {len(train_patients)} | Val: {len(val_patients)} | Test: {len(test_patients)}")
+else:
+print(f"❌ CRITICAL LEAKAGE: {num_leaked} overlapping patient IDs found!")
+print("-" * 30)
+def build_diagnostic_stgnn(input_shape=(500, 12), num_classes=4):
+inputs = Input(shape=input_shape)
+# 1. Spatial/Temporal Feature Extraction
+x = SeparableConv1D(32, kernel_size=5, padding='same')(inputs)
+x = BatchNormalization()(x) # <--- Included: Stabilizes the gradients
+x = Activation('relu')(x)
+# 2. Aggregation
+x = GlobalAveragePooling1D()(x)
+# 3. Dense Classifier Head
+x = Dropout(0.3)(x) # <--- Added: Prevents the model from 'memorizing' CMI
+x = Dense(32, activation='relu')(x)
+x = BatchNormalization()(x) # <--- Added: Keeps the dense layer output scaled
+outputs = Dense(num_classes, activation='softmax')(x)
+return Model(inputs=inputs, outputs=outputs)
+# Updated function: Returns 36 features (3 metrics * 12 leads)
+def extract_clinical_features(X):
+# 1. QRS: Range between 10th and 90th percentile
+qrs_width = np.percentile(X, 90, axis=1) - np.percentile(X, 10, axis=1)
+# 2. Heart Rate Proxy: Variance
+hr_proxy = np.var(X, axis=1)
+# 3. ST-Deviation: Mean of absolute values in the tail
+st_deviation = np.mean(np.abs(X[:, 350:, :]), axis=1)
+features = np.hstack([qrs_width, hr_proxy, st_deviation])
+# MANDATORY: Normalize to 0 mean and 1 variance
+return (features - np.mean(features, axis=0)) / (np.std(features, axis=0) + 1e-6)
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, SeparableConv1D, BatchNormalization, Activation, GlobalAveragePooling1D, Dense, Concatenate, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+# 1. ARCHITECTURE: Dual-Input ST-GNN
+def build_clinical_stgnn(input_shape=(500, 12), clinical_shape=(36,)):
+# Branch 1: Raw Waveform
+waveform_input = Input(shape=input_shape, name='waveform')
+x = SeparableConv1D(64, kernel_size=5, padding='same')(waveform_input)
+x = BatchNormalization()(x)
+x = Activation('relu')(x)
+x = GlobalAveragePooling1D()(x)
+# Branch 2: Clinical Features
+clinical_input = Input(shape=clinical_shape, name='clinical_features')
+# Merge branches
+# We assign this to 'x' so the next layer can find it
+x = Concatenate()([x, clinical_input])
+# Deeper Classifier Head
+x = Dense(128, activation='relu')(x)
+x = BatchNormalization()(x)
+x = Dropout(0.4)(x)
+x = Dense(64, activation='relu')(x)
+outputs = Dense(4, activation='softmax')(x)
+return Model(inputs=[waveform_input, clinical_input], outputs=outputs)
+# 2. DATA PREPARATION: Ensure shapes match
+# NOTE: You must prepare 'clinical_train' (n_samples, 3) and 'clinical_val' (n_samples, 3)
+# These represent [QRS_width, Heart_Rate, ST_Deviation]
+# 1. Build the model
+model = build_clinical_stgnn(input_shape=(500, 12), clinical_shape=(36,)) # Ensure shape matches extract_clinical_features(X)
+def focal_loss(gamma=2.0, alpha=0.25):
+def focal_loss_fixed(y_true, y_pred):
+# Convert integer labels to one-hot inside the loss function
+y_true = tf.one_hot(tf.cast(y_true, tf.int32), depth=4)
+y_true = tf.cast(y_true, tf.float32)
+epsilon = 1e-7
+y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+cross_entropy = -y_true * tf.math.log(y_pred)
+weight = alpha * tf.pow((1 - y_pred), gamma)
+loss = weight * cross_entropy
+return tf.reduce_sum(loss, axis=-1)
+return focal_loss_fixed
+# Update compile call
+model.compile(
+optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
+loss=focal_loss(gamma=2.0, alpha=0.25),
+metrics=['accuracy']
+)
+# 1. RE-GENERATE CLINICAL DATA WITH 36 FEATURES
+# This matches the new clinical_shape=(36,) in your build_clinical_stgnn function
+clinical_train = extract_clinical_features(X_train_final)
+clinical_val = extract_clinical_features(X_val)
+clinical_test = extract_clinical_features(X_test) # Added for your upcoming evaluation
+# 2. VERIFY SHAPES
+print(f"Clinical Train shape: {clinical_train.shape}") # Should be (N, 36)
+print(f"Clinical Val shape: {clinical_val.shape}") # Should be (N, 36)
+# Run this BEFORE model.fit if you aren't sure
+y_train_ready = to_categorical(y_train_ready, num_classes=4)
+y_val_ready = to_categorical(y_val_ready, num_classes=4)
+# 1. STOP: Reset to the source of truth
+# Assuming you have a list called 'all_labels' that was correctly generated
+# during your initial data processing phase:
+print(f"Original all_labels length: {len(all_labels)}")
+# 2. Slice it to match your training set index
+# You already performed the train/val/test split using 'train_idx'
+# We must use that same index to extract the correct labels
+y_train_ready = to_categorical(le.transform(np.array(all_labels)[train_idx]), num_classes=4)
+y_train_flat = np.argmax(y_train_ready, axis=1)
+# 3. VERIFY
+print(f"Corrected y_train_flat shape: {y_train_flat.shape}")
+# This MUST be (1916,)
+# Now, and ONLY now, run model.fit
+# Update your fit call to use these flattened arrays
+history = model.fit(
+x={'waveform': X_train_final, 'clinical_features': clinical_train},
+y=y_train_flat,
+epochs=100,
+batch_size=32,
+validation_data=(
+{'waveform': X_val, 'clinical_features': clinical_val},
+y_val_flat
+),
+class_weight={0: 1.5, 1: 1.0, 2: 1.0, 3: 1.5},
+callbacks=[
+EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
+ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
+],
+verbose=1
+)
+# 1. Generate clinical features for the test set
+clinical_test = extract_clinical_features(X_test)
+# 2. Update the evaluation call
+# We pass a list [X_test, clinical_test] to match the 2 inputs the model expects
+test_loss, test_acc = model.evaluate(
+x={'waveform': X_test, 'clinical_features': clinical_test},
+y=y_test,
+verbose=0
+)
+print(f"Test Accuracy: {test_acc:.4f}")
+print(f"Test Loss: {test_loss:.4f}")
+# 3. Update the prediction call (for Confusion Matrix)
+y_pred_probs = model.predict(
+x={'waveform': X_test, 'clinical_features': clinical_test},
+verbose=0
+)
+y_pred = np.argmax(y_pred_probs, axis=1)
+y_true = np.argmax(y_test, axis=1)
+# --- 1. EVALUATION & THRESHOLDING ---
+y_pred_probs = model.predict(test_data, verbose=0)
+threshold = 0.6 # 60% Confidence Threshold
+y_pred = []
+for probs in y_pred_probs:
+# If the model's confidence in class 0 (AMI) is > 0.6, take it.
+# Otherwise, pick the class with the highest probability.
+if probs[0] > threshold:
+y_pred.append(0)
+else:
+y_pred.append(np.argmax(probs))
+y_pred = np.array(y_pred)
+y_true = np.argmax(y_test, axis=1)
+# --- 2. CONFUSION MATRIX (Now using the new y_pred) ---
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+xticklabels=le.classes_,
+yticklabels=le.classes_)
+plt.title('Confusion Matrix: Test Set (Thresholded)')
+plt.show()
+# --- 3. DETAILED REPORT ---
+print("\nClassification Report (Test Set):")
+print(classification_report(y_true, y_pred, target_names=le.classes_))
+# Check if the split was actually leak-proof
+train_patients = set(np.array(groups_list)[train_idx])
+val_patients = set(np.array(groups_list)[val_idx])
+overlap = train_patients.intersection(val_patients)
+if len(overlap) > 0:
+print(f"❌ LEAKAGE FOUND: {len(overlap)} patients are in both sets!")
+else:
+print("✅ Split is clean. The model is likely over-performing on database characteristics.")
